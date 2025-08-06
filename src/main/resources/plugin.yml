@@ -1,0 +1,22 @@
+name: GGZ-Status
+version: '1.0-SNAPSHOT'
+main: net.griefergamez.ggzstatus.Status
+api-version: '1.21'
+authors: [ FlexKleks ]
+description: Status command
+website: https://griefergamez.net
+depend: [LuckPerms]
+
+commands:
+  status:
+    description: Setze deinen Status für den Join-Chat
+    usage: /status <set|toggle|delete|block|unblock>
+    aliases: [st]
+
+permissions:
+  griefergamez.status.use:
+    description: Erlaubt Nutzung von /status
+    default: false
+  griefergamez.status.admin:
+    description: Erlaubt Nutzung von /status block, unblock
+    default: op
