@@ -11,4 +11,3 @@ commands:
     description: Setze deinen Status für den Join-Chat
     usage: /status <set|toggle|delete|block|unblock>
     aliases: [ st ]
-    permission: griefergamez.status.use
