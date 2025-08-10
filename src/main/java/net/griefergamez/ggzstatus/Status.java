@@ -122,7 +122,9 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
 
                             for (Player x : Bukkit.getOnlinePlayers()) {
                                 x.sendMessage(full);
-                                x.playSound(x.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1F, 1F);
+                                if (p.hasPermission("griefergamez.status.sound")) {
+                                    x.playSound(x.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1F, 1F);
+                                }
                             }
 
                             lastBroadcast.put(id, System.currentTimeMillis());
@@ -178,9 +180,16 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
         Player p = (Player) s;
         UUID id = p.getUniqueId();
 
-        if (!p.hasPermission("griefergamez.status.use")) {
-            p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du benötigst mindestens den <yellow>Champ-Rang <red>um dieses Feature nutzen zu können.")));
-            return true;
+        if (args.length > 0 && args[0].equalsIgnoreCase("toggle")) {
+            if (!p.hasPermission("griefergamez.status.toggle")) {
+                p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Keine Rechte.")));
+                return true;
+            }
+        } else {
+            if (!p.hasPermission("griefergamez.status.use")) {
+                p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du benötigst mindestens den <yellow>Champ-Rang <red>um dieses Feature nutzen zu können.")));
+                return true;
+            }
         }
         if (args.length == 0) {
             Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
