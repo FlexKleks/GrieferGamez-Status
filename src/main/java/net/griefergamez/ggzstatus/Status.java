@@ -28,7 +28,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
     private Connection connection;
     private LuckPerms luckPerms;
     private MiniMessage miniMessage;
-    private static final long COOLDOWN = 30 * 60 * 1000; // 30 Minuten
+    private static final long COOLDOWN = 1 * 60 * 60 * 1000; // 60 Minuten
     private final Map<UUID, Long> lastBroadcast = new ConcurrentHashMap<>();
     private final Map<UUID, BukkitRunnable> pendingStatusSet = new ConcurrentHashMap<>();
 
@@ -122,7 +122,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
 
                             for (Player x : Bukkit.getOnlinePlayers()) {
                                 x.sendMessage(full);
-                                x.playSound(x.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 5F, 1F);
+                                x.playSound(x.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1F, 1F);
                             }
 
                             lastBroadcast.put(id, System.currentTimeMillis());
@@ -179,7 +179,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
         UUID id = p.getUniqueId();
 
         if (!p.hasPermission("griefergamez.status.use")) {
-            p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Dazu hast du keine Rechte.")));
+            p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du benötigst mindestens den <yellow>Champ-Rang <red>um dieses Feature nutzen zu können.")));
             return true;
         }
         if (args.length == 0) {
@@ -189,7 +189,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                     ps.setString(1, id.toString());
                     ResultSet rs = ps.executeQuery();
                     if (!rs.next()) {
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du hast aktuell keinen Status gesetzt. Nutze <yellow>/status set <red>um deinen Status zu setzen.")));
+                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du hast aktuell keinen Status gesetzt. Nutze <yellow>/status set <red>um deinen Status zu setzen. Gebe anschließend deinen Status im Chat ein.")));
                         return;
                     }
 
@@ -252,8 +252,12 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                     return true;
                 }
 
-                p.sendMessage(getPrefix().append(miniMessage.deserialize("<gray>Bitte gib deinen Status im Chat ein. Mit <yellow>-cancel <gray>kannst du abbrechen.")));
+                p.sendMessage(getPrefix().append(miniMessage.deserialize(
+                        "<gray>Bitte gib deinen Status im Chat ein. Mit <red>-cancel <gray>kannst du abbrechen.")));
 
+                p.sendMessage(getPrefix().append(miniMessage.deserialize(
+                        "<gray><italic>Tipp:</italic> Du kannst <gold>MiniMessage</gold> für Farben, Formatierungen & mehr nutzen.\n"
+                                + "<gray>Besuche dafür die Webseite: <click:open_url:'https://shorturl.at/kCTN2'><hover:show_text:'<gray>Öffnet den MiniMessage generator.'><aqua>https://shorturl.at/kCTN2</aqua></hover></click>")));
                 BukkitRunnable timeout = new BukkitRunnable() {
                     public void run() {
                         if (pendingStatusSet.containsKey(id)) {
@@ -263,7 +267,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                     }
                 };
                 pendingStatusSet.put(id, timeout);
-                timeout.runTaskLater(this, 20 * 20); // 20 Sekunden Timeout
+                timeout.runTaskLater(this, 40 * 20); // 40 Sekunden Timeout
                 return true;
 
             case "toggle":
@@ -273,7 +277,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                         ps.setString(1, id.toString());
                         ResultSet rs = ps.executeQuery();
                         if (!rs.next()) {
-                            p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du hast aktuell keinen Status gesetzt. Nutze <yellow>/status set <red>um deinen Status zu setzen.")));
+                            p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du hast aktuell keinen Status gesetzt. Nutze <yellow>/status set <red>um deinen Status zu setzen. Gebe anschließend im Chat den Text ein.")));
                             return;
                         }
 
@@ -300,7 +304,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                             "DELETE FROM statuses WHERE uuid = ?")) {
                         ps.setString(1, id.toString());
                         int updated = ps.executeUpdate();
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize(updated > 0 ? "<gray>Status <green>gelöscht." : "<red>Kein Status gefunden.")));
+                        p.sendMessage(getPrefix().append(miniMessage.deserialize(updated > 0 ? "<gray>Dein Status wurde <red>gelöscht<gray>!" : "<red>Es wurde kein Status gefunden. Setze ihn mit <yellow>/status set")));
                     } catch (SQLException e) {
                         p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Fehler beim Löschen.")));
                     }
