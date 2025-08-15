@@ -180,9 +180,16 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
         Player p = (Player) s;
         UUID id = p.getUniqueId();
 
-        if (!p.hasPermission("griefergamez.status.use")) {
-            p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du benötigst mindestens den <yellow>Champ-Rang <red>um dieses Feature nutzen zu können.")));
-            return true;
+        if (args.length > 0 && args[0].equalsIgnoreCase("toggle")) {
+            if (!p.hasPermission("griefergamez.status.toggle")) {
+                p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Keine Rechte.")));
+                return true;
+            }
+        } else {
+            if (!p.hasPermission("griefergamez.status.use")) {
+                p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du benötigst mindestens den <yellow>Champ-Rang <red>um dieses Feature nutzen zu können.")));
+                return true;
+            }
         }
         if (args.length == 0) {
             Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
