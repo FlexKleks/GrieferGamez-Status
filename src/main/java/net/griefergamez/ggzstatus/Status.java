@@ -122,7 +122,9 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
 
                             for (Player x : Bukkit.getOnlinePlayers()) {
                                 x.sendMessage(full);
-                                x.playSound(x.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1F, 1F);
+                                if (p.hasPermission("griefergamez.status.sound")) {
+                                    x.playSound(x.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1F, 1F);
+                                }
                             }
 
                             lastBroadcast.put(id, System.currentTimeMillis());
