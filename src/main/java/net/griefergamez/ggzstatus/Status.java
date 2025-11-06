@@ -43,17 +43,18 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                     "message TEXT, " +
                     "enabled INTEGER, " +
                     "blocked_until INTEGER DEFAULT 0, " +
-                    "last_sent INTEGER DEFAULT 0)";
-    private static final String LOAD_STATUS_SQL = "SELECT message, enabled, blocked_until, last_sent FROM statuses WHERE uuid = ?";
+                    "last_sent INTEGER DEFAULT 0, " +
+                    "sound INTEGER DEFAULT 1)";
+    private static final String LOAD_STATUS_SQL = "SELECT message, enabled, blocked_until, last_sent, sound FROM statuses WHERE uuid = ?";
     private static final String UPSERT_MESSAGE_SQL =
-            "INSERT INTO statuses(uuid,message,enabled,blocked_until,last_sent) VALUES(?,?,1,0,0) " +
+            "INSERT INTO statuses(uuid,message,enabled,blocked_until,last_sent,sound) VALUES(?,?,1,0,0,1) " +
                     "ON CONFLICT(uuid) DO UPDATE SET message=excluded.message, enabled=1";
     private static final String SELECT_ENABLED_SQL = "SELECT enabled FROM statuses WHERE uuid = ?";
     private static final String UPDATE_ENABLED_SQL = "UPDATE statuses SET enabled = ? WHERE uuid = ?";
     private static final String DELETE_SQL = "DELETE FROM statuses WHERE uuid = ?";
     private static final String UPSERT_BLOCK_SQL =
-            "INSERT INTO statuses(uuid,message,enabled,blocked_until) VALUES(?,?,0,?) " +
-                    "ON CONFLICT(uuid) DO UPDATE SET blocked_until = ?";
+            "INSERT INTO statuses(uuid,message,enabled,blocked_until,last_sent,sound) VALUES(?,?,0,?,0,1) " +
+                    "ON CONFLICT(uuid) DO UPDATE SET blocked_until = excluded.blocked_until";
     private static final String UNBLOCK_SQL = "UPDATE statuses SET blocked_until = 0 WHERE uuid = ?";
 
     @Override
@@ -76,6 +77,12 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
 
             try (Statement s = connection.createStatement()) {
                 s.execute(CREATE_TABLE_SQL);
+            }
+
+            // best effort: falls alte DB, füge Spalte sound hinzu
+            try (Statement s = connection.createStatement()) {
+                s.execute("ALTER TABLE statuses ADD COLUMN sound INTEGER DEFAULT 1");
+            } catch (SQLException ignored) {
             }
 
             // best effort: column last_sent existiert durch CREATE, aber falls alte DB, ignorieren
@@ -111,12 +118,14 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
         final boolean enabled;
         final long blockedUntil;
         final long lastSent;
+        final boolean soundEnabled;
 
-        StatusRecord(String message, boolean enabled, long blockedUntil, long lastSent) {
+        StatusRecord(String message, boolean enabled, long blockedUntil, long lastSent, boolean soundEnabled) {
             this.message = message;
             this.enabled = enabled;
             this.blockedUntil = blockedUntil;
             this.lastSent = lastSent;
+            this.soundEnabled = soundEnabled;
         }
     }
 
@@ -135,7 +144,8 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                         rs.getString("message"),
                         rs.getInt("enabled") == 1,
                         rs.getLong("blocked_until"),
-                        rs.getLong("last_sent")
+                        rs.getLong("last_sent"),
+                        rs.getInt("sound") == 1
                 ));
             }
         } catch (SQLException e) {
@@ -169,6 +179,25 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
         }
     }
 
+    private boolean toggleSound(UUID id) throws SQLException {
+        String select = "SELECT sound FROM statuses WHERE uuid = ?";
+        String update = "UPDATE statuses SET sound = ? WHERE uuid = ?";
+        try (PreparedStatement ps = connection.prepareStatement(select)) {
+            ps.setString(1, id.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return false;
+                boolean sound = rs.getInt("sound") == 1;
+                int newState = sound ? 0 : 1;
+                try (PreparedStatement upd = connection.prepareStatement(update)) {
+                    upd.setInt(1, newState);
+                    upd.setString(2, id.toString());
+                    upd.executeUpdate();
+                }
+                return true;
+            }
+        }
+    }
+
     private int deleteStatus(UUID id) throws SQLException {
         try (PreparedStatement ps = connection.prepareStatement(DELETE_SQL)) {
             ps.setString(1, id.toString());
@@ -181,7 +210,6 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
             ps.setString(1, id.toString());
             ps.setString(2, "");
             ps.setLong(3, until);
-            ps.setLong(4, until);
             ps.executeUpdate();
         }
     }
@@ -215,6 +243,8 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
             String conv = translateToMiniMessage(record.message);
             Component msg = miniMessage.deserialize(conv);
 
+            final boolean playSoundForThisStatus = record.soundEnabled;
+
             // LuckPerms async load and schedule broadcast on main thread
             luckPerms.getUserManager().loadUser(id).thenAccept(user -> {
                 boolean allowed = user.getCachedData().getPermissionData()
@@ -232,7 +262,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
 
                         for (Player x : Bukkit.getOnlinePlayers()) {
                             x.sendMessage(full);
-                            if (p.hasPermission("griefergame.status.sound")) {
+                            if (playSoundForThisStatus) {
                                 x.playSound(x.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1F, 1F);
                             }
                         }
@@ -288,10 +318,23 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
         Player p = (Player) s;
         UUID id = p.getUniqueId();
 
-        if (args.length > 0 && args[0].equalsIgnoreCase("toggle")) {
-            if (!p.hasPermission("griefergame.status.toggle")) {
-                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Keine Rechte.")));
-                return true;
+        // Berechtigungsübersicht: spezifische Subcommands prüfen
+        if (args.length > 0) {
+            if (args[0].equalsIgnoreCase("toggle")) {
+                if (!p.hasPermission("griefergame.status.toggle")) {
+                    p.sendMessage(prefix.append(miniMessage.deserialize("<red>Keine Rechte.")));
+                    return true;
+                }
+            } else if (args[0].equalsIgnoreCase("sound")) {
+                if (!p.hasPermission("griefergame.status.sound")) {
+                    p.sendMessage(prefix.append(miniMessage.deserialize("<red>Keine Rechte.")));
+                    return true;
+                }
+            } else {
+                if (!p.hasPermission("griefergame.status.use")) {
+                    p.sendMessage(prefix.append(miniMessage.deserialize("<red>Du benötigst mindestens den <dark_purple>Supreme-Rang <red>um dieses Feature nutzen zu können.")));
+                    return true;
+                }
             }
         } else {
             if (!p.hasPermission("griefergame.status.use")) {
@@ -317,7 +360,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                     return;
                 }
 
-                // Use loadUser synchronously from luckperms (blocking call may be ok on main thread, but we are on async)
+                // Use loadUser synchronously from luckperms (blocking call may be ok on main thread, aber wir sind async)
                 luckPerms.getUserManager().loadUser(id).thenAccept(user -> {
                     if (user == null) {
                         Bukkit.getScheduler().runTask(this, () ->
@@ -343,13 +386,15 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                     String cooldownLine = remainingCooldown > 0
                             ? "<gray>Dein Status wird wieder in <yellow>" + remainingMin + " Minuten <gray> gesendet."
                             : "<gray>Dein Status wird beim nächsten Join gesendet.";
+                    String soundLine = rec.soundEnabled ? "<green>Sound aktiviert" : "<red>Sound deaktiviert";
 
                     Bukkit.getScheduler().runTask(this, () -> {
                         p.sendMessage(prefix.append(miniMessage.deserialize("<gray>Dein Status ist aktuell " + statusLine + "<gray>. Dieser hat eine Abklingzeit von <yellow>" + (COOLDOWN / 1000 / 60) + " Minuten.")));
                         p.sendMessage(prefix.append(miniMessage.deserialize("<gray>Dein Status sieht aktuell so aus:")));
                         p.sendMessage(Component.empty().append(suffix).append(Component.space()).append(name).append(Component.text(" ")).append(msg));
                         p.sendMessage(prefix.append(miniMessage.deserialize(cooldownLine)));
-                        p.sendMessage(prefix.append(miniMessage.deserialize("<gray>Nutze <yellow>/status set<gray>, um deinen Status zu setzen. Mit <yellow>/status toggle<gray> kannst du ihn aktivieren/deaktivieren.")));
+                        p.sendMessage(prefix.append(miniMessage.deserialize("<gray>" + soundLine)));
+                        p.sendMessage(prefix.append(miniMessage.deserialize("<gray>Nutze <yellow>/status set<gray>, um deinen Status zu setzen. Mit <yellow>/status toggle<gray> kannst du ihn aktivieren/deaktivieren. Mit <yellow>/status sound<gray> kannst du den Join-Sound umschalten.")));
                     });
                 });
             });
@@ -389,6 +434,20 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                     } catch (SQLException e) {
                         Bukkit.getScheduler().runTask(this, () ->
                                 p.sendMessage(prefix.append(miniMessage.deserialize("<red>Fehler beim Umschalten."))));
+                    }
+                });
+                return true;
+
+            case "sound":
+                // Berechtigung wird oben geprüft
+                runDbAsync(() -> {
+                    try {
+                        boolean ok = toggleSound(id);
+                        Bukkit.getScheduler().runTask(this, () ->
+                                p.sendMessage(prefix.append(miniMessage.deserialize(ok ? "<green>Sound umgeschaltet." : "<red>Kein Eintrag gefunden. Lege zuerst einen Status an mit <yellow>/status set"))));
+                    } catch (SQLException e) {
+                        Bukkit.getScheduler().runTask(this, () ->
+                                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Fehler beim Umschalten des Sounds."))));
                     }
                 });
                 return true;
@@ -490,7 +549,7 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
     @Override
     public List<String> onTabComplete(CommandSender s, Command c, String alias, String[] args) {
         if (args.length == 1)
-            return Arrays.asList("set", "toggle", "delete", "block", "unblock")
+            return Arrays.asList("set", "toggle", "delete", "block", "unblock", "sound")
                     .stream().filter(x -> x.startsWith(args[0].toLowerCase()))
                     .collect(Collectors.toList());
 

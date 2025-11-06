@@ -1,5 +1,5 @@
 name: GG-Status
-version: '1.0-SNAPSHOT'
+version: '1.0.0'
 main: net.griefergamez.ggzstatus.Status
 api-version: '1.21'
 authors: [ FlexKleks ]
@@ -9,5 +9,5 @@ depend: [LuckPerms]
 commands:
   status:
     description: Setze deinen Status für den Join-Chat
-    usage: /status <set|toggle|delete|block|unblock>
+    usage: /status <set|sound|toggle|delete|block|unblock>
     aliases: [ st ]
