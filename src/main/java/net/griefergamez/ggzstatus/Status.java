@@ -19,6 +19,7 @@ import org.bukkit.scheduler.BukkitRunnable;
 
 import java.io.File;
 import java.sql.*;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -28,14 +29,40 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
     private Connection connection;
     private LuckPerms luckPerms;
     private MiniMessage miniMessage;
-    private static final long COOLDOWN = 1 * 60 * 60 * 1000; // 60 Minuten
+    private LegacyComponentSerializer legacySerializer;
+    private Component prefix;
+    private Component cachedSuffix;
+    private static final long COOLDOWN = Duration.ofMinutes(60).toMillis();
     private final Map<UUID, Long> lastBroadcast = new ConcurrentHashMap<>();
     private final Map<UUID, BukkitRunnable> pendingStatusSet = new ConcurrentHashMap<>();
+
+    // SQL
+    private static final String CREATE_TABLE_SQL =
+            "CREATE TABLE IF NOT EXISTS statuses (" +
+                    "uuid TEXT PRIMARY KEY, " +
+                    "message TEXT, " +
+                    "enabled INTEGER, " +
+                    "blocked_until INTEGER DEFAULT 0, " +
+                    "last_sent INTEGER DEFAULT 0)";
+    private static final String LOAD_STATUS_SQL = "SELECT message, enabled, blocked_until, last_sent FROM statuses WHERE uuid = ?";
+    private static final String UPSERT_MESSAGE_SQL =
+            "INSERT INTO statuses(uuid,message,enabled,blocked_until,last_sent) VALUES(?,?,1,0,0) " +
+                    "ON CONFLICT(uuid) DO UPDATE SET message=excluded.message, enabled=1";
+    private static final String SELECT_ENABLED_SQL = "SELECT enabled FROM statuses WHERE uuid = ?";
+    private static final String UPDATE_ENABLED_SQL = "UPDATE statuses SET enabled = ? WHERE uuid = ?";
+    private static final String DELETE_SQL = "DELETE FROM statuses WHERE uuid = ?";
+    private static final String UPSERT_BLOCK_SQL =
+            "INSERT INTO statuses(uuid,message,enabled,blocked_until) VALUES(?,?,0,?) " +
+                    "ON CONFLICT(uuid) DO UPDATE SET blocked_until = ?";
+    private static final String UNBLOCK_SQL = "UPDATE statuses SET blocked_until = 0 WHERE uuid = ?";
 
     @Override
     public void onEnable() {
         luckPerms = LuckPermsProvider.get();
         miniMessage = MiniMessage.miniMessage();
+        legacySerializer = LegacyComponentSerializer.legacySection();
+        prefix = miniMessage.deserialize("<dark_gray>[<gold>GrieferGame</gold><dark_gray>] </dark_gray>");
+        cachedSuffix = legacySerializer.deserialize("§-§7§2§5§2§e§9§d§6⚐");
 
         getServer().getPluginManager().registerEvents(this, this);
         Objects.requireNonNull(getCommand("status")).setExecutor(this);
@@ -47,27 +74,28 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
             Class.forName("org.sqlite.JDBC");
             connection = DriverManager.getConnection("jdbc:sqlite:" + db.getPath());
 
-            connection.createStatement().execute(
-                    "CREATE TABLE IF NOT EXISTS statuses (" +
-                            "uuid TEXT PRIMARY KEY, " +
-                            "message TEXT, " +
-                            "enabled INTEGER, " +
-                            "blocked_until INTEGER DEFAULT 0, " +
-                            "last_sent INTEGER DEFAULT 0)"
-            );
+            try (Statement s = connection.createStatement()) {
+                s.execute(CREATE_TABLE_SQL);
+            }
 
-            try {
-                connection.createStatement().execute("ALTER TABLE statuses ADD COLUMN last_sent INTEGER DEFAULT 0");
+            // best effort: column last_sent existiert durch CREATE, aber falls alte DB, ignorieren
+            try (Statement s = connection.createStatement()) {
+                s.execute("ALTER TABLE statuses ADD COLUMN last_sent INTEGER DEFAULT 0");
             } catch (SQLException ignored) {
             }
 
         } catch (Exception e) {
             getLogger().severe("DB error: " + e.getMessage());
+            // falls DB fehlt, plugin nicht fatal stoppen - aber weitere DB-Operationen schlagen fehl
         }
     }
 
     @Override
     public void onDisable() {
+        // cancel pending runnables
+        pendingStatusSet.values().forEach(BukkitRunnable::cancel);
+        pendingStatusSet.clear();
+
         if (connection != null) {
             try {
                 connection.close();
@@ -77,64 +105,143 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
         }
     }
 
+    // Hilfsklasse für Statusdaten (kein Record, weil Abwärtskompatibilität)
+    private static class StatusRecord {
+        final String message;
+        final boolean enabled;
+        final long blockedUntil;
+        final long lastSent;
+
+        StatusRecord(String message, boolean enabled, long blockedUntil, long lastSent) {
+            this.message = message;
+            this.enabled = enabled;
+            this.blockedUntil = blockedUntil;
+            this.lastSent = lastSent;
+        }
+    }
+
+    /* ----------------- Helper: DB / Async Utils ----------------- */
+
+    private void runDbAsync(Runnable task) {
+        Bukkit.getScheduler().runTaskAsynchronously(this, task);
+    }
+
+    private Optional<StatusRecord> loadStatus(UUID id) {
+        try (PreparedStatement ps = connection.prepareStatement(LOAD_STATUS_SQL)) {
+            ps.setString(1, id.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return Optional.empty();
+                return Optional.of(new StatusRecord(
+                        rs.getString("message"),
+                        rs.getInt("enabled") == 1,
+                        rs.getLong("blocked_until"),
+                        rs.getLong("last_sent")
+                ));
+            }
+        } catch (SQLException e) {
+            getLogger().severe("Load status error: " + e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    private void upsertMessage(UUID id, String message) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(UPSERT_MESSAGE_SQL)) {
+            ps.setString(1, id.toString());
+            ps.setString(2, message);
+            ps.executeUpdate();
+        }
+    }
+
+    private boolean toggleEnabled(UUID id) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(SELECT_ENABLED_SQL)) {
+            ps.setString(1, id.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return false;
+                boolean enabled = rs.getInt("enabled") == 1;
+                int newState = enabled ? 0 : 1;
+                try (PreparedStatement update = connection.prepareStatement(UPDATE_ENABLED_SQL)) {
+                    update.setInt(1, newState);
+                    update.setString(2, id.toString());
+                    update.executeUpdate();
+                }
+                return true;
+            }
+        }
+    }
+
+    private int deleteStatus(UUID id) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(DELETE_SQL)) {
+            ps.setString(1, id.toString());
+            return ps.executeUpdate();
+        }
+    }
+
+    private void blockStatus(UUID id, long until) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(UPSERT_BLOCK_SQL)) {
+            ps.setString(1, id.toString());
+            ps.setString(2, "");
+            ps.setLong(3, until);
+            ps.setLong(4, until);
+            ps.executeUpdate();
+        }
+    }
+
+    private int unblockStatus(UUID id) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement(UNBLOCK_SQL)) {
+            ps.setString(1, id.toString());
+            return ps.executeUpdate();
+        }
+    }
+
+    /* ----------------- Events ----------------- */
+
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent e) {
         Player p = e.getPlayer();
         UUID id = p.getUniqueId();
         long now = System.currentTimeMillis();
 
-        if (lastBroadcast.containsKey(id) && now - lastBroadcast.get(id) < COOLDOWN) return;
+        if (lastBroadcast.getOrDefault(id, 0L) + COOLDOWN > now) return;
 
-        // Status laden
-        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "SELECT message, enabled, blocked_until FROM statuses WHERE uuid = ?")) {
-                ps.setString(1, id.toString());
-                ResultSet rs = ps.executeQuery();
+        runDbAsync(() -> {
+            Optional<StatusRecord> maybe = loadStatus(id);
+            if (!maybe.isPresent()) return;
+            StatusRecord record = maybe.get();
 
-                if (!rs.next()) return;
+            if (record.blockedUntil > System.currentTimeMillis()) return;
+            if (!record.enabled) return;
 
-                long blockedUntil = rs.getLong("blocked_until");
-                if (blockedUntil > System.currentTimeMillis()) return;
-                if (rs.getInt("enabled") != 1) return;
+            // Convert and prepare component once
+            String conv = translateToMiniMessage(record.message);
+            Component msg = miniMessage.deserialize(conv);
 
-                String raw = rs.getString("message");
-                String conv = translateToMiniMessage(raw);
-                Component msg = miniMessage.deserialize(conv);
+            // LuckPerms async load and schedule broadcast on main thread
+            luckPerms.getUserManager().loadUser(id).thenAccept(user -> {
+                boolean allowed = user.getCachedData().getPermissionData()
+                        .checkPermission("griefergame.status.use").asBoolean();
+                if (!allowed) return;
 
-                // LuckPerms: Permission-Check
-                luckPerms.getUserManager().loadUser(id).thenAcceptAsync(user -> {
-                    boolean allowed = user.getCachedData().getPermissionData()
-                            .checkPermission("griefergamez.status.use").asBoolean();
-                    if (!allowed) return;
+                new BukkitRunnable() {
+                    @Override
+                    public void run() {
+                        Component displayName = legacySerializer.deserialize(p.getDisplayName());
+                        Component full = Component.empty()
+                                .append(cachedSuffix).append(Component.space())
+                                .append(displayName).append(Component.text(" "))
+                                .append(msg);
 
-                    new BukkitRunnable() {
-                        @Override
-                        public void run() {
-                            Component suffixComponent = LegacyComponentSerializer.legacySection()
-                                    .deserialize("§-§7§2§5§2§e§9§d§6⚐");
-                            Component displayName = LegacyComponentSerializer.legacySection()
-                                    .deserialize(p.getDisplayName());
-                            Component full = Component.empty()
-                                    .append(suffixComponent).append(Component.space())
-                                    .append(displayName).append(Component.text(" "))
-                                    .append(msg);
-
-                            for (Player x : Bukkit.getOnlinePlayers()) {
-                                x.sendMessage(full);
-                                if (p.hasPermission("griefergamez.status.sound")) {
-                                    x.playSound(x.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1F, 1F);
-                                }
+                        for (Player x : Bukkit.getOnlinePlayers()) {
+                            x.sendMessage(full);
+                            if (p.hasPermission("griefergame.status.sound")) {
+                                x.playSound(x.getLocation(), Sound.UI_TOAST_CHALLENGE_COMPLETE, 1F, 1F);
                             }
-
-                            lastBroadcast.put(id, System.currentTimeMillis());
-                            luckPerms.getUserManager().saveUser(user);
                         }
-                    }.runTaskLater(this, 60L);
-                });
-            } catch (SQLException ex) {
-                getLogger().severe("Load status error: " + ex.getMessage());
-            }
+
+                        lastBroadcast.put(id, System.currentTimeMillis());
+                        // saveUser nur wenn nötig - hier nur aufrufen falls modifiziert (aus Kompatibilitätsgründen entfernt)
+                    }
+                }.runTaskLater(this, 60L);
+            });
         });
     }
 
@@ -150,25 +257,26 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
 
         if (msg.equalsIgnoreCase("-cancel")) {
             pendingStatusSet.remove(id).cancel();
-            p.sendMessage(getPrefix().append(miniMessage.deserialize("<gray>Deine Eingabe wurde abgebrochen.")));
+            p.sendMessage(prefix.append(miniMessage.deserialize("<gray>Deine Eingabe wurde abgebrochen.")));
             return;
         }
 
-        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-            try (PreparedStatement ps = connection.prepareStatement(
-                    "INSERT INTO statuses(uuid,message,enabled,blocked_until) VALUES(?,?,1,0) " +
-                            "ON CONFLICT(uuid) DO UPDATE SET message=excluded.message,enabled=1;")) {
-                ps.setString(1, id.toString());
-                ps.setString(2, msg);
-                ps.executeUpdate();
+        runDbAsync(() -> {
+            try {
+                upsertMessage(id, msg);
+                // Feedback auf main thread
+                Bukkit.getScheduler().runTask(this, () ->
+                        p.sendMessage(prefix.append(miniMessage.deserialize("<green>Dein Status wurde erfolgreich gesetzt."))));
             } catch (SQLException ex) {
-                p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>DB-Fehler: " + ex.getMessage())));
+                Bukkit.getScheduler().runTask(this, () ->
+                        p.sendMessage(prefix.append(miniMessage.deserialize("<red>DB-Fehler: " + ex.getMessage()))));
             }
         });
 
         pendingStatusSet.remove(id).cancel();
-        p.sendMessage(getPrefix().append(miniMessage.deserialize("<green>Dein Status wurde erfolgreich gesetzt.")));
     }
+
+    /* ----------------- Commands ----------------- */
 
     @Override
     public boolean onCommand(CommandSender s, Command c, String label, String[] args) {
@@ -181,97 +289,90 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
         UUID id = p.getUniqueId();
 
         if (args.length > 0 && args[0].equalsIgnoreCase("toggle")) {
-            if (!p.hasPermission("griefergamez.status.toggle")) {
-                p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Keine Rechte.")));
+            if (!p.hasPermission("griefergame.status.toggle")) {
+                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Keine Rechte.")));
                 return true;
             }
         } else {
-            if (!p.hasPermission("griefergamez.status.use")) {
-                p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du benötigst mindestens den <yellow>Champ-Rang <red>um dieses Feature nutzen zu können.")));
+            if (!p.hasPermission("griefergame.status.use")) {
+                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Du benötigst mindestens den <dark_purple>Supreme-Rang <red>um dieses Feature nutzen zu können.")));
                 return true;
             }
         }
+
         if (args.length == 0) {
-            Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-                try (PreparedStatement ps = connection.prepareStatement(
-                        "SELECT message, enabled, blocked_until FROM statuses WHERE uuid = ?")) {
-                    ps.setString(1, id.toString());
-                    ResultSet rs = ps.executeQuery();
-                    if (!rs.next()) {
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du hast aktuell keinen Status gesetzt. Nutze <yellow>/status set <red>um deinen Status zu setzen. Gebe anschließend deinen Status im Chat ein.")));
+            runDbAsync(() -> {
+                Optional<StatusRecord> maybe = loadStatus(id);
+                if (!maybe.isPresent()) {
+                    Bukkit.getScheduler().runTask(this, () -> p.sendMessage(prefix.append(miniMessage.deserialize("<red>Du hast aktuell keinen Status gesetzt. Nutze <yellow>/status set <red>um deinen Status zu setzen. Gebe anschließend deinen Status im Chat ein."))));
+                    return;
+                }
+
+                StatusRecord rec = maybe.get();
+
+                if (rec.blockedUntil > System.currentTimeMillis()) {
+                    long remaining = (rec.blockedUntil - System.currentTimeMillis()) / 1000 / 60;
+                    Bukkit.getScheduler().runTask(this, () ->
+                            p.sendMessage(prefix.append(miniMessage.deserialize("<red>Dein Status ist blockiert für noch <yellow>" + remaining + " Minuten."))));
+                    return;
+                }
+
+                // Use loadUser synchronously from luckperms (blocking call may be ok on main thread, but we are on async)
+                luckPerms.getUserManager().loadUser(id).thenAccept(user -> {
+                    if (user == null) {
+                        Bukkit.getScheduler().runTask(this, () ->
+                                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Fehler beim Laden deines Status."))));
                         return;
                     }
 
-                    String msgRaw = rs.getString("message");
-                    boolean enabled = rs.getInt("enabled") == 1;
-                    long blockedUntil = rs.getLong("blocked_until");
-                    long remainingCooldown = COOLDOWN - (System.currentTimeMillis() - lastBroadcast.getOrDefault(id, 0L));
-                    long remainingMin = Math.max(0, remainingCooldown / 1000 / 60);
+                    String conv = translateToMiniMessage(rec.message);
+                    Component msg = miniMessage.deserialize(conv);
 
-                    String statusLine = enabled ? "<green>aktiviert" : "<red>deaktiviert";
+                    String rawSuffix = Optional.ofNullable(user.getCachedData().getMetaData().getSuffix()).orElse("§-§7§2§5§2§e§9§d§6⚐");
+                    rawSuffix = PlaceholderAPI.setPlaceholders(p, rawSuffix);
+                    Component suffix = legacySerializer.deserialize(rawSuffix);
+
+                    String rawDisplayName = Optional.ofNullable(user.getCachedData().getMetaData().getPrefix()).orElse("") + p.getName();
+                    rawDisplayName = PlaceholderAPI.setPlaceholders(p, rawDisplayName);
+                    Component name = legacySerializer.deserialize(rawDisplayName);
+
+                    long remainingCooldown = Math.max(0, COOLDOWN - (System.currentTimeMillis() - lastBroadcast.getOrDefault(id, 0L)));
+                    long remainingMin = remainingCooldown / 1000 / 60;
+
+                    String statusLine = rec.enabled ? "<green>aktiviert" : "<red>deaktiviert";
                     String cooldownLine = remainingCooldown > 0
                             ? "<gray>Dein Status wird wieder in <yellow>" + remainingMin + " Minuten <gray> gesendet."
                             : "<gray>Dein Status wird beim nächsten Join gesendet.";
 
-                    if (blockedUntil > System.currentTimeMillis()) {
-                        long remaining = (blockedUntil - System.currentTimeMillis()) / 1000 / 60;
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Dein Status ist blockiert für noch <yellow>" + remaining + " Minuten.")));
-                        return;
-                    }
-
-                    User user = luckPerms.getUserManager().getUser(id);
-                    if (user == null) {
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Fehler beim Laden deines Status.")));
-                        return;
-                    }
-
-                    String conv = translateToMiniMessage(msgRaw);
-                    Component msg = miniMessage.deserialize(conv);
-                    String suffixRaw = user.getCachedData().getMetaData().getSuffix();
-                    if (suffixRaw == null) suffixRaw = "";
-
-                    String displayName = user.getCachedData().getMetaData().getPrefix();
-                    if (displayName == null) displayName = "";
-                    displayName += p.getName();
-
-                    String rawSuffix = luckPerms.getUserManager().getUser(id).getCachedData().getMetaData().getSuffix();
-                    if (rawSuffix == null) rawSuffix = "§-§7§2§5§2§e§9§d§6⚐";
-                    rawSuffix = PlaceholderAPI.setPlaceholders(p, rawSuffix); // <-- PlaceholderAPI verarbeiten
-                    Component suffix = LegacyComponentSerializer.legacySection().deserialize("§-§7§2§5§2§e§9§d§6⚐");
-                    String rawDisplayName = PlaceholderAPI.setPlaceholders(p, p.getDisplayName());
-                    Component name = LegacyComponentSerializer.legacySection().deserialize(rawDisplayName);
-
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<gray>Dein Status ist aktuell " + statusLine + "<gray>. Dieser hat eine Abklingzeit von <yellow>" + (COOLDOWN / 1000 / 60) + " Minuten.")));
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<gray>Dein Status sieht aktuell so aus:")));
-                    p.sendMessage(Component.empty().append(suffix).append(Component.space()).append(name).append(Component.text(" ")).append(msg));
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize(cooldownLine)));
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<gray>Nutze <yellow>/status set<gray>, um deinen Status zu setzen. Mit <yellow>/status toggle<gray> kannst du ihn aktivieren/deaktivieren.")));
-                } catch (Exception ex) {
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Fehler beim Laden deines Status.")));
-                }
+                    Bukkit.getScheduler().runTask(this, () -> {
+                        p.sendMessage(prefix.append(miniMessage.deserialize("<gray>Dein Status ist aktuell " + statusLine + "<gray>. Dieser hat eine Abklingzeit von <yellow>" + (COOLDOWN / 1000 / 60) + " Minuten.")));
+                        p.sendMessage(prefix.append(miniMessage.deserialize("<gray>Dein Status sieht aktuell so aus:")));
+                        p.sendMessage(Component.empty().append(suffix).append(Component.space()).append(name).append(Component.text(" ")).append(msg));
+                        p.sendMessage(prefix.append(miniMessage.deserialize(cooldownLine)));
+                        p.sendMessage(prefix.append(miniMessage.deserialize("<gray>Nutze <yellow>/status set<gray>, um deinen Status zu setzen. Mit <yellow>/status toggle<gray> kannst du ihn aktivieren/deaktivieren.")));
+                    });
+                });
             });
             return true;
         }
-        String sub = args[0].toLowerCase();
 
+        String sub = args[0].toLowerCase();
         switch (sub) {
             case "set":
                 if (pendingStatusSet.containsKey(id)) {
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du setzt bereits einen Status. Nutze <yellow>-cancel <red>um abzubrechen.")));
+                    p.sendMessage(prefix.append(miniMessage.deserialize("<red>Du setzt bereits einen Status. Nutze <yellow>-cancel <red>um abzubrechen.")));
                     return true;
                 }
 
-                p.sendMessage(getPrefix().append(miniMessage.deserialize(
-                        "<gray>Bitte gib deinen Status im Chat ein. Mit <red>-cancel <gray>kannst du abbrechen.")));
-
-                p.sendMessage(getPrefix().append(miniMessage.deserialize(
+                p.sendMessage(prefix.append(miniMessage.deserialize("<gray>Bitte gib deinen Status im Chat ein. Mit <red>-cancel <gray>kannst du abbrechen.")));
+                p.sendMessage(prefix.append(miniMessage.deserialize(
                         "<gray><italic>Tipp:</italic> Du kannst <gold>MiniMessage</gold> für Farben, Formatierungen & mehr nutzen.\n"
                                 + "<gray>Besuche dafür die Webseite: <click:open_url:'https://shorturl.at/kCTN2'><hover:show_text:'<gray>Öffnet den MiniMessage generator.'><aqua>https://shorturl.at/kCTN2</aqua></hover></click>")));
                 BukkitRunnable timeout = new BukkitRunnable() {
                     public void run() {
                         if (pendingStatusSet.containsKey(id)) {
                             pendingStatusSet.remove(id);
-                            p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Eingabe wurde abgebrochen. (Timeout)")));
+                            p.sendMessage(prefix.append(miniMessage.deserialize("<red>Eingabe wurde abgebrochen. (Timeout)")));
                         }
                     }
                 };
@@ -280,135 +381,103 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
                 return true;
 
             case "toggle":
-                Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-                    try (PreparedStatement ps = connection.prepareStatement(
-                            "SELECT enabled FROM statuses WHERE uuid = ?")) {
-                        ps.setString(1, id.toString());
-                        ResultSet rs = ps.executeQuery();
-                        if (!rs.next()) {
-                            p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du hast aktuell keinen Status gesetzt. Nutze <yellow>/status set <red>um deinen Status zu setzen. Gebe anschließend im Chat den Text ein.")));
-                            return;
-                        }
-
-                        boolean enabled = rs.getInt("enabled") == 1;
-                        int newState = enabled ? 0 : 1;
-
-                        try (PreparedStatement update = connection.prepareStatement(
-                                "UPDATE statuses SET enabled = ? WHERE uuid = ?")) {
-                            update.setInt(1, newState);
-                            update.setString(2, id.toString());
-                            update.executeUpdate();
-                        }
-
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize(newState == 1 ? "Status <green>aktiviert." : "Status <red>deaktiviert.")));
+                runDbAsync(() -> {
+                    try {
+                        boolean ok = toggleEnabled(id);
+                        Bukkit.getScheduler().runTask(this, () ->
+                                p.sendMessage(prefix.append(miniMessage.deserialize(ok ? ("" + "<green>Status umgeschaltet.") : "<red>Kein Eintrag gefunden."))));
                     } catch (SQLException e) {
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Fehler beim Umschalten.")));
+                        Bukkit.getScheduler().runTask(this, () ->
+                                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Fehler beim Umschalten."))));
                     }
                 });
                 return true;
 
             case "delete":
-                Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-                    try (PreparedStatement ps = connection.prepareStatement(
-                            "DELETE FROM statuses WHERE uuid = ?")) {
-                        ps.setString(1, id.toString());
-                        int updated = ps.executeUpdate();
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize(updated > 0 ? "<gray>Dein Status wurde <red>gelöscht<gray>!" : "<red>Es wurde kein Status gefunden. Setze ihn mit <yellow>/status set")));
+                runDbAsync(() -> {
+                    try {
+                        int updated = deleteStatus(id);
+                        Bukkit.getScheduler().runTask(this, () ->
+                                p.sendMessage(prefix.append(miniMessage.deserialize(updated > 0 ? "<gray>Dein Status wurde <red>gelöscht<gray>!" : "<red>Es wurde kein Status gefunden. Setze ihn mit <yellow>/status set"))));
                     } catch (SQLException e) {
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Fehler beim Löschen.")));
+                        Bukkit.getScheduler().runTask(this, () ->
+                                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Fehler beim Löschen."))));
                     }
                 });
                 return true;
 
             case "block":
-                if (!p.hasPermission("griefergamez.status.admin")) {
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Keine Rechte.")));
+                if (!p.hasPermission("griefergame.status.admin")) {
+                    p.sendMessage(prefix.append(miniMessage.deserialize("<red>Keine Rechte.")));
                     return true;
                 }
-
                 if (args.length < 3) {
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<gray>/status block <Spieler> <Zeit z.B. 10s, 5m, 2h>")));
+                    p.sendMessage(prefix.append(miniMessage.deserialize("<gray>/status block <Spieler> <Zeit z.B. 10s, 5m, 2h>")));
                     return true;
                 }
-
                 OfflinePlayer target = Bukkit.getOfflinePlayer(args[1]);
                 long seconds;
-
                 try {
                     seconds = parseTimeToSeconds(args[2]);
                 } catch (NumberFormatException ex) {
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Ungültiges Zeitformat.")));
+                    p.sendMessage(prefix.append(miniMessage.deserialize("<red>Ungültiges Zeitformat.")));
                     return true;
                 }
-
                 long until = System.currentTimeMillis() + (seconds * 1000);
-
-                Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-                    try (PreparedStatement ps = connection.prepareStatement(
-                            "INSERT INTO statuses(uuid,message,enabled,blocked_until) VALUES(?,?,0,?) " +
-                                    "ON CONFLICT(uuid) DO UPDATE SET blocked_until = ?")) {
-                        ps.setString(1, target.getUniqueId().toString());
-                        ps.setString(2, "");
-                        ps.setLong(3, until);
-                        ps.setLong(4, until);
-                        ps.executeUpdate();
-
-                        if (target.isOnline()) {
-                            Player onlineTarget = target.getPlayer();
-                            if (onlineTarget != null) {
-                                onlineTarget.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Du wurdest blockiert für <yellow>" + args[2])));
+                runDbAsync(() -> {
+                    try {
+                        blockStatus(target.getUniqueId(), until);
+                        Bukkit.getScheduler().runTask(this, () -> {
+                            if (target.isOnline() && target.getPlayer() != null) {
+                                target.getPlayer().sendMessage(prefix.append(miniMessage.deserialize("<red>Du wurdest blockiert für <yellow>" + args[2])));
                             }
-                        }
-
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<green>Spieler blockiert für <yellow>" + args[2])));
+                            p.sendMessage(prefix.append(miniMessage.deserialize("<green>Spieler blockiert für <yellow>" + args[2])));
+                        });
                     } catch (SQLException e) {
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Datenbankfehler: " + e.getMessage())));
+                        Bukkit.getScheduler().runTask(this, () ->
+                                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Datenbankfehler: " + e.getMessage()))));
                     }
                 });
                 return true;
 
             case "unblock":
-                if (!p.hasPermission("griefergamez.status.admin")) {
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Keine Rechte.")));
+                if (!p.hasPermission("griefergame.status.admin")) {
+                    p.sendMessage(prefix.append(miniMessage.deserialize("<red>Keine Rechte.")));
                     return true;
                 }
-
                 if (args.length < 2) {
-                    p.sendMessage(getPrefix().append(miniMessage.deserialize("<gray>/status unblock <Spieler>")));
+                    p.sendMessage(prefix.append(miniMessage.deserialize("<gray>/status unblock <Spieler>")));
                     return true;
                 }
-
                 OfflinePlayer unblock = Bukkit.getOfflinePlayer(args[1]);
-
-                Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-                    try (PreparedStatement ps = connection.prepareStatement(
-                            "UPDATE statuses SET blocked_until = 0 WHERE uuid = ?")) {
-                        ps.setString(1, unblock.getUniqueId().toString());
-                        int rows = ps.executeUpdate();
-
-                        if (rows > 0) {
-                            p.sendMessage(getPrefix().append(miniMessage.deserialize("<green>Blockierung aufgehoben.")));
-
-                            if (unblock.isOnline()) {
-                                unblock.getPlayer().sendMessage(getPrefix().append(miniMessage.deserialize("<green>Du wurdest entblockt.")));
+                runDbAsync(() -> {
+                    try {
+                        int rows = unblockStatus(unblock.getUniqueId());
+                        Bukkit.getScheduler().runTask(this, () -> {
+                            if (rows > 0) {
+                                p.sendMessage(prefix.append(miniMessage.deserialize("<green>Blockierung aufgehoben.")));
+                                if (unblock.isOnline() && unblock.getPlayer() != null) {
+                                    unblock.getPlayer().sendMessage(prefix.append(miniMessage.deserialize("<green>Du wurdest entblockt.")));
+                                }
+                            } else {
+                                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Kein Eintrag gefunden.")));
                             }
-                        } else {
-                            p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Kein Eintrag gefunden.")));
-                        }
+                        });
                     } catch (SQLException e) {
-                        p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Fehler beim Entblocken.")));
+                        Bukkit.getScheduler().runTask(this, () ->
+                                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Fehler beim Entblocken."))));
                     }
                 });
                 return true;
 
             default:
-                p.sendMessage(getPrefix().append(miniMessage.deserialize("<red>Unbekannter Subbefehl.")));
+                p.sendMessage(prefix.append(miniMessage.deserialize("<red>Unbekannter Subbefehl.")));
                 return true;
         }
     }
 
     private long parseTimeToSeconds(String input) throws NumberFormatException {
-        input = input.toLowerCase();
+        input = input.toLowerCase(Locale.ROOT).trim();
         long multiplier;
         if (input.endsWith("d")) multiplier = 86400;
         else if (input.endsWith("h")) multiplier = 3600;
@@ -440,27 +509,48 @@ public class Status extends JavaPlugin implements Listener, CommandExecutor, Tab
         return List.of();
     }
 
-    private Component getPrefix() {
-        return miniMessage.deserialize("<dark_gray>[<gold>GrieferGamez</gold><dark_gray>] </dark_gray>");
-    }
-
     public static String translateToMiniMessage(String input) {
-        List<String> legacy = Arrays.asList(
-                "&0", "&1", "&2", "&3", "&4", "&5", "&6", "&7",
-                "&8", "&9", "&a", "&b", "&c", "&d", "&e", "&f",
-                "&l", "&m", "&n", "&o", "&k", "&r"
-        );
-        List<String> colors = Arrays.asList(
-                "<black>", "<dark_blue>", "<dark_green>", "<dark_aqua>", "<dark_red>", "<dark_purple>",
-                "<gold>", "<gray>", "<dark_gray>", "<blue>", "<green>", "<aqua>", "<red>", "<light_purple>",
-                "<yellow>", "<white>", "<b>", "<st>", "<u>", "<i>", "<obf>", "<reset>"
-        );
-
+        if (input == null) return "";
         input = input.replace('§', '&');
-        for (int i = 0; i < legacy.size(); i++) {
-            input = input.replace(legacy.get(i), colors.get(i));
+        // schnelleres Ersetzen durch einmaliges Durchlaufen der Zeichen, statt viele replace-Aufrufe
+        StringBuilder out = new StringBuilder(input.length() + 16);
+        for (int i = 0; i < input.length(); i++) {
+            char c = input.charAt(i);
+            if (c == '&' && i + 1 < input.length()) {
+                char code = Character.toLowerCase(input.charAt(i + 1));
+                String repl = null;
+                switch (code) {
+                    case '0': repl = "<black>"; break;
+                    case '1': repl = "<dark_blue>"; break;
+                    case '2': repl = "<dark_green>"; break;
+                    case '3': repl = "<dark_aqua>"; break;
+                    case '4': repl = "<dark_red>"; break;
+                    case '5': repl = "<dark_purple>"; break;
+                    case '6': repl = "<gold>"; break;
+                    case '7': repl = "<gray>"; break;
+                    case '8': repl = "<dark_gray>"; break;
+                    case '9': repl = "<blue>"; break;
+                    case 'a': repl = "<green>"; break;
+                    case 'b': repl = "<aqua>"; break;
+                    case 'c': repl = "<red>"; break;
+                    case 'd': repl = "<light_purple>"; break;
+                    case 'e': repl = "<yellow>"; break;
+                    case 'f': repl = "<white>"; break;
+                    case 'l': repl = "<b>"; break;
+                    case 'm': repl = "<st>"; break;
+                    case 'n': repl = "<u>"; break;
+                    case 'o': repl = "<i>"; break;
+                    case 'k': repl = "<obf>"; break;
+                    case 'r': repl = "<reset>"; break;
+                }
+                if (repl != null) {
+                    out.append(repl);
+                    i++; // skip code
+                    continue;
+                }
+            }
+            out.append(c);
         }
-
-        return input;
+        return out.toString();
     }
 }

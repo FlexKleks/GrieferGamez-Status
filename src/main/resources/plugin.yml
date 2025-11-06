@@ -1,10 +1,10 @@
-name: GGZ-Status
+name: GG-Status
 version: '1.0-SNAPSHOT'
 main: net.griefergamez.ggzstatus.Status
 api-version: '1.21'
 authors: [ FlexKleks ]
 description: Status command
-website: https://griefergamez.net
+website: https://griefergame.net
 depend: [LuckPerms]
 commands:
   status:
